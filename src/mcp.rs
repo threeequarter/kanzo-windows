@@ -2,7 +2,7 @@
 //! Replies are short plain text to save agents' tokens.
 
 use std::fmt::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
@@ -24,7 +24,8 @@ use crate::store::{self, Error, Project, Store, Task, TaskPatch, short_time};
 const DONE_LISTED: usize = 20;
 
 const INSTRUCTIONS: &str = "The user's kanban board, on this machine, for all their projects. Tasks look like \
-api#12. Without `project`, Kanzo uses the project linked to this folder's GitHub repo. Keep it current unasked: \
+api#12. Without `project`, Kanzo uses the project named in a .kanzo file in this folder or one above it, \
+or else the one linked to this folder's GitHub repo. Keep it current unasked: \
 doing when you start a task, comments on what you did, review when you finish or get stuck. Leave done and \
 human tasks to the user.";
 
@@ -36,8 +37,9 @@ done and human tasks to the user.";
 /// `kanzo mcp`: one agent on stdin and stdout, in the folder it started us in.
 pub async fn serve(home: Home) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_default();
+    let workspace = Workspace::find(&cwd);
     let repos = git_repos(&cwd);
-    let server = Kanzo { ctx: Arc::new(Ctx { home, cwd: Some(cwd), repos }), tool_router: Kanzo::tools() };
+    let server = Kanzo { ctx: Arc::new(Ctx { home, cwd: Some(cwd), workspace, repos }), tool_router: Kanzo::tools() };
     let service = server.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
@@ -47,7 +49,7 @@ pub async fn serve(home: Home) -> Result<()> {
 /// checks (`web::protect`) guard it, including when it listens on the network, so
 /// rmcp's localhost-only list is turned off here.
 pub fn http_service(home: Home, shutdown: CancellationToken) -> StreamableHttpService<Kanzo, LocalSessionManager> {
-    let ctx = Arc::new(Ctx { home, cwd: None, repos: Vec::new() });
+    let ctx = Arc::new(Ctx { home, cwd: None, workspace: None, repos: Vec::new() });
     let config = StreamableHttpServerConfig::default().disable_allowed_hosts().with_cancellation_token(shutdown);
     // rmcp makes a server per session, and for some requests; the tool list is built once.
     let tool_router = Kanzo::tools();
@@ -62,15 +64,56 @@ struct Ctx {
     home: Home,
     /// The agent's working folder; `None` over HTTP, where we cannot know it.
     cwd: Option<PathBuf>,
+    /// The `.kanzo` file over `cwd`, if there is one.
+    workspace: Option<Workspace>,
     /// GitHub repos (`owner/repo`) of the git remotes of `cwd`.
     repos: Vec<String>,
 }
 
+/// A `.kanzo` file naming the project of every folder under it, like a workspace of
+/// several repos, or a folder with no git remote: `project = "api"`.
+struct Workspace {
+    file: PathBuf,
+    /// The project's slug, or why the file can't be read.
+    project: std::result::Result<String, String>,
+}
+
+impl Workspace {
+    /// The nearest `.kanzo` in `dir` or a folder above it.
+    fn find(dir: &Path) -> Option<Self> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct File {
+            project: String,
+        }
+        let file = dir.ancestors().map(|d| d.join(".kanzo")).find(|f| f.is_file())?;
+        let project = std::fs::read_to_string(&file)
+            .map_err(|e| e.to_string())
+            .and_then(|text| toml::from_str::<File>(&text).map_err(|e| e.message().to_string()))
+            .map(|f| f.project);
+        Some(Self { file, project })
+    }
+}
+
 impl Ctx {
-    /// The named project, or the one linked to this folder's git remote.
+    /// The named project, or the one the `.kanzo` file over this folder names, or the one
+    /// linked to this folder's git remote. A `.kanzo` that names no project fails rather
+    /// than fall back to the remote, which may belong to another project.
     fn project(&self, store: &Store, name: Option<&str>) -> store::Result<Project> {
         if let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) {
             return store.find_project(name);
+        }
+        if let Some(Workspace { file, project }) = &self.workspace {
+            let file = file.display();
+            let slug = project
+                .as_deref()
+                .map_err(|e| Error::Invalid(format!("{file} should hold a line like project = \"api\": {e}")))?;
+            return store.find_project(slug).map_err(|e| match e {
+                Error::NotFound(m) => Error::NotFound(format!(
+                    "{file} names a project that doesn't exist: {m}. Create it with create_project, or change the file."
+                )),
+                e => e,
+            });
         }
         for repo in &self.repos {
             if let Some(p) = store.project_by_repo(repo)? {
@@ -98,7 +141,10 @@ impl Ctx {
                  Create one with create_project and repo \"{repo}\"."
             ),
             (None, false) => {
-                format!("Cannot tell the project: {cwd} has no git remote. Pass `project` (one of: {known}).")
+                format!(
+                    "Cannot tell the project: {cwd} has no git remote. Pass `project` (one of: {known}); \
+                     a .kanzo file with project = \"<slug>\" in this folder or one above it sets it for good."
+                )
             }
             (None, true) => "There are no projects yet. Create one with create_project.".to_string(),
         };
@@ -559,4 +605,57 @@ fn task_detail(ctx: &Ctx, store: &Store, t: &Task) -> store::Result<String> {
     }
     out.truncate(out.trim_end().len());
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A board with projects `api` (linked to me/api) and `ops`, and an agent in `cwd`
+    /// whose git remote is me/api.
+    fn ctx(board: &Path, cwd: &Path) -> (Ctx, Store) {
+        let home = Home::open(board.to_path_buf()).unwrap();
+        let store = home.store().unwrap();
+        store.create_project("api", "", Some("me/api")).unwrap();
+        store.create_project("ops", "", None).unwrap();
+        let ctx =
+            Ctx { home, cwd: Some(cwd.to_path_buf()), workspace: Workspace::find(cwd), repos: vec!["me/api".into()] };
+        (ctx, store)
+    }
+
+    #[test]
+    fn workspace_file_names_the_project_of_folders_under_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("ws/code/api");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(tmp.path().join("ws/.kanzo"), "project = \"ops\"\n").unwrap();
+        let (ctx, store) = ctx(&tmp.path().join("board"), &repo);
+        // Before the git remote, which belongs to api; after a `project` the agent passes.
+        assert_eq!(ctx.project(&store, None).unwrap().slug, "ops");
+        assert_eq!(ctx.project(&store, Some("api")).unwrap().slug, "api");
+
+        // The nearest file wins.
+        std::fs::write(tmp.path().join("ws/code/.kanzo"), "project = \"api\"\n").unwrap();
+        assert_eq!(Workspace::find(&repo).unwrap().project.unwrap(), "api");
+    }
+
+    #[test]
+    fn without_a_workspace_file_the_git_remote_decides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ctx, store) = ctx(&tmp.path().join("board"), tmp.path());
+        assert!(ctx.workspace.is_none());
+        assert_eq!(ctx.project(&store, None).unwrap().slug, "api");
+    }
+
+    #[test]
+    fn a_broken_workspace_file_fails_instead_of_falling_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join(".kanzo");
+        for (text, says) in [("project = \"web\"\n", "doesn't exist"), ("projekt = \"api\"\n", "should hold a line")] {
+            std::fs::write(&file, text).unwrap();
+            let (ctx, store) = ctx(&tmp.path().join(format!("board-{}", says.len())), tmp.path());
+            let err = ctx.project(&store, None).unwrap_err().to_string();
+            assert!(err.contains(says) && err.contains(&file.display().to_string()), "{err}");
+        }
+    }
 }

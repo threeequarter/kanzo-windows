@@ -34,6 +34,8 @@ cargo +stable-aarch64-pc-windows-gnullvm build --release --target x86_64-pc-wind
 
 Each `kanzo.exe` needs only what Windows ships. Copy it to a folder on `PATH`, such as `~/.cargo/bin`, rather than running it from `target`, which the next build overwrites. Then `kanzo service install` adds a Task Scheduler task that starts the board at logon, without admin rights; logs go to `%LOCALAPPDATA%\kanzo\kanzo.log`. To install a new build: `kanzo service uninstall`, replace the file, `kanzo service install`.
 
+Agents find the project from a `.kanzo` file too: put one holding `project = "api"` in a folder, and every agent started in it or below works on that project, before any git remote counts. It suits a workspace of several repos, or a folder with no remote.
+
 ## Install
 
 ```sh
