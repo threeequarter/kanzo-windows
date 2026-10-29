@@ -32,9 +32,11 @@ tokio-util = "0.7.20"
 toml = { version = "1.1.8", default-features = false, features = ["std", "parse", "serde"] }
 
 # Already built in by other crates; reads the database's file ID, and runs the logon
-# task without a console window.
+# task, and the programs it starts, without console windows.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console"] }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

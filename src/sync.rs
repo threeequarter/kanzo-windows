@@ -6,6 +6,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 use crate::home::{Home, NO_LOCKS};
+use crate::service::no_window;
 use crate::store::Store;
 
 pub enum Keep {
@@ -265,7 +266,7 @@ fn replace<T>(home: &Home, pull: impl FnOnce() -> Result<T>) -> Result<()> {
 /// Git in `dir`; without `prompt` it fails rather than ask for a password or passphrase.
 fn command(dir: &Path, prompt: bool, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(dir).args(args);
+    no_window(&mut cmd).arg("-C").arg(dir).args(args);
     if !prompt {
         cmd.env("GIT_TERMINAL_PROMPT", "0").env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
     }
@@ -289,7 +290,7 @@ fn git_ok(dir: &Path, prompt: bool, args: &[&str]) -> bool {
 /// The machine's name for commit messages, like "Ada's MacBook Air".
 fn hostname() -> String {
     let run = |cmd: &str, args: &[&str]| {
-        Command::new(cmd)
+        no_window(&mut Command::new(cmd))
             .args(args)
             .output()
             .ok()

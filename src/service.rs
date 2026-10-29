@@ -273,11 +273,12 @@ fn install_task(home: &Home, exe: &Path) -> Result<()> {
     xml.extend(task_xml(exe, &home.dir, &user).encode_utf16().flat_map(u16::to_le_bytes));
     let file = std::env::temp_dir().join("kanzo-task.xml");
     std::fs::write(&file, xml).with_context(|| format!("cannot write {}", file.display()))?;
-    // Replace an older install so a changed path or data folder takes effect.
-    let _ = Command::new("schtasks").args(["/End", "/TN", TASK]).output();
     let created = run("schtasks", &["/Create", "/TN", TASK, "/XML", &file.to_string_lossy(), "/F"]);
     let _ = std::fs::remove_file(&file);
     created?;
+    // Replacing the task leaves the old board running; restart it so a changed path or
+    // data folder takes effect. A failed install never gets here, so the board stays up.
+    let _ = Command::new("schtasks").args(["/End", "/TN", TASK]).output();
     run("schtasks", &["/Run", "/TN", TASK])?;
     println!(
         "Kanzo now starts at login and is running at http://localhost:{}\nLogs: {}",
@@ -299,6 +300,22 @@ fn uninstall_task() -> Result<()> {
     Ok(())
 }
 
+/// Set once `detach_console` has run.
+#[cfg(windows)]
+static DETACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Keeps `cmd` from flashing a console window: Windows opens one for each program that
+/// a process without a console starts, like git for the board the logon task runs.
+/// From a terminal, programs share it as before, so git can still ask for a passphrase.
+pub fn no_window(cmd: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    if DETACHED.load(std::sync::atomic::Ordering::Relaxed) {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 /// For the task's `--background`: closes the console window Windows opens for it, and
 /// sends what Kanzo prints to the log instead. Kanzo runs on without a log if it
 /// can't open one.
@@ -308,6 +325,7 @@ pub fn detach_console() {
     use windows_sys::Win32::System::Console::{FreeConsole, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle};
     // SAFETY: no arguments; it only detaches this process from its console.
     unsafe { FreeConsole() };
+    DETACHED.store(true, std::sync::atomic::Ordering::Relaxed);
     let Ok(path) = log_path() else { return };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);

@@ -107,7 +107,9 @@ impl Ctx {
 }
 
 fn git_repos(dir: &std::path::Path) -> Vec<String> {
-    let Ok(out) = Command::new("git").arg("-C").arg(dir).args(["remote", "-v"]).output() else {
+    let Ok(out) =
+        crate::service::no_window(&mut Command::new("git")).arg("-C").arg(dir).args(["remote", "-v"]).output()
+    else {
         return Vec::new();
     };
     let text = String::from_utf8_lossy(&out.stdout);

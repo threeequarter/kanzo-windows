@@ -162,7 +162,7 @@ impl Guard {
         let mut names = Vec::new();
         if lan {
             let run = |cmd: &str, args: &[&str]| {
-                std::process::Command::new(cmd)
+                crate::service::no_window(&mut std::process::Command::new(cmd))
                     .args(args)
                     .output()
                     .ok()
