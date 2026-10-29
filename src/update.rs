@@ -2,6 +2,7 @@
 //! program, then start the new one in place. It uses `curl` and `sh`, which macOS and
 //! Linux have, so Kanzo needs no HTTP client of its own.
 
+#[cfg(unix)]
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -10,6 +11,11 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
+
+/// The Windows build is updated by merging the upstream repo and building it again,
+/// never by downloading releases on its own.
+pub const SELF_UPDATE: bool = cfg!(not(windows));
+pub const NO_SELF_UPDATE: &str = "this build doesn't update itself: merge upstream and build Kanzo again";
 
 /// Where releases are published; `KANZO_RELEASES_URL` points elsewhere, for tests.
 const RELEASES: &str = "https://github.com/emanuele-em/kanzo/releases/latest/download";
@@ -31,6 +37,9 @@ fn curl(url: &str) -> Option<Vec<u8>> {
 /// The latest released version, checked at most once a day unless `now`; `None` when
 /// it can't be found, like offline.
 pub fn latest(now: bool) -> Option<String> {
+    if !SELF_UPDATE {
+        return None;
+    }
     let mut cached = LATEST.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((at, version)) = &*cached
         && !now
@@ -56,6 +65,9 @@ pub fn newer(version: &str) -> bool {
 /// Runs the latest release's installer over this program and returns its path,
 /// ready to restart.
 pub fn install() -> Result<PathBuf, String> {
+    if !SELF_UPDATE {
+        return Err(NO_SELF_UPDATE.into());
+    }
     let exe = std::env::current_exe().and_then(|p| p.canonicalize()).map_err(|e| e.to_string())?;
     // The installer writes to <dir>/bin, so it can only replace a program kept in a bin folder.
     let dir = match exe.parent() {
@@ -88,6 +100,7 @@ pub fn install() -> Result<PathBuf, String> {
 }
 
 /// The arguments to start again with: the same ones, without opening another browser tab.
+#[cfg(unix)]
 fn restart_args(args: impl Iterator<Item = OsString>) -> Vec<OsString> {
     let mut args: Vec<OsString> = args.collect();
     if !args.iter().any(|a| a == "--no-open") {
@@ -122,6 +135,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn restarts_without_opening_a_tab() {
         let args = |v: &[&str]| v.iter().map(OsString::from).collect::<Vec<_>>();
         assert_eq!(restart_args(args(&["--port", "4300"]).into_iter()), args(&["--port", "4300", "--no-open"]));

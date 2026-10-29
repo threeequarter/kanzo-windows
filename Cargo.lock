@@ -666,6 +666,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+ "windows-sys",
 ]
 
 [[package]]

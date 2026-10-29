@@ -628,12 +628,13 @@ struct UpdateQuery {
 }
 
 /// This version, the latest release (`null` when GitHub can't be reached) and, when
-/// that one is newer, `available`.
+/// that one is newer, `available`; `off` when this build doesn't update itself.
 async fn update_status(Query(q): Query<UpdateQuery>) -> Response {
     let now = q.now.is_some();
     let latest = tokio::task::spawn_blocking(move || update::latest(now)).await.ok().flatten();
     let available = latest.clone().filter(|v| update::newer(v));
-    Json(json!({ "current": update::CURRENT, "latest": latest, "available": available })).into_response()
+    let off = !update::SELF_UPDATE;
+    Json(json!({ "current": update::CURRENT, "latest": latest, "available": available, "off": off })).into_response()
 }
 
 /// Installs the latest release over this program, answers, then starts it in place.
@@ -666,8 +667,9 @@ async fn is_kanzo(port: u16) -> bool {
 }
 
 fn open_browser(url: &str) {
-    if cfg!(target_os = "macos") {
-        if std::process::Command::new("open").arg(url).spawn().is_err() {
+    if cfg!(target_os = "macos") || cfg!(windows) {
+        let opener = if cfg!(windows) { "explorer.exe" } else { "open" };
+        if std::process::Command::new(opener).arg(url).spawn().is_err() {
             eprintln!("Open {url} in your browser.");
         }
         return;

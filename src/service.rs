@@ -1,5 +1,6 @@
 //! `kanzo service`: run the board in the background, started at login.
-//! A LaunchAgent on macOS, a systemd user unit on Linux (a Raspberry Pi, an old laptop).
+//! A LaunchAgent on macOS, a systemd user unit on Linux (a Raspberry Pi, an old laptop),
+//! a Task Scheduler task on Windows.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -10,6 +11,7 @@ use crate::home::Home;
 
 const LABEL: &str = "com.github.emanuele-em.kanzo";
 const UNIT: &str = "kanzo.service";
+const TASK: &str = "Kanzo";
 
 pub fn install(home: &Home) -> Result<()> {
     let exe = std::env::current_exe().context("cannot find the kanzo program")?;
@@ -17,8 +19,10 @@ pub fn install(home: &Home) -> Result<()> {
         install_launchd(home, &exe)
     } else if cfg!(target_os = "linux") {
         install_systemd(home, &exe)
+    } else if cfg!(windows) {
+        install_task(home, &exe)
     } else {
-        bail!("kanzo service supports macOS and Linux; start `kanzo --no-open` with your own service manager")
+        bail!("kanzo service supports macOS, Linux and Windows; start `kanzo --no-open` with your own service manager")
     }
 }
 
@@ -27,8 +31,10 @@ pub fn uninstall() -> Result<()> {
         uninstall_launchd()
     } else if cfg!(target_os = "linux") {
         uninstall_systemd()
+    } else if cfg!(windows) {
+        uninstall_task()
     } else {
-        bail!("kanzo service supports macOS and Linux")
+        bail!("kanzo service supports macOS, Linux and Windows")
     }
 }
 
@@ -199,6 +205,124 @@ fn uninstall_systemd() -> Result<()> {
     Ok(())
 }
 
+// Windows
+
+/// `%LOCALAPPDATA%\kanzo\kanzo.log`: the task has no console to write to.
+fn log_path() -> Result<PathBuf> {
+    Ok(dirs::data_local_dir().context("cannot find your local app data folder")?.join("kanzo").join("kanzo.log"))
+}
+
+/// Quotes one argument for a Windows command line.
+fn windows_quote(s: &str) -> String {
+    // A backslash before the closing quote would escape it, as in "C:\".
+    let trailing = s.len() - s.trim_end_matches('\\').len();
+    format!("\"{s}{}\"", "\\".repeat(trailing))
+}
+
+/// The task: started at this user's logon, as this user, without admin rights, so it
+/// reaches the data folder and git's credentials. One copy at a time, no time limit,
+/// on battery too.
+fn task_xml(exe: &Path, dir: &Path, user: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Kanzo board</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <UserId>{user}</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{user}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>3</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{exe}</Command>
+      <Arguments>--background --no-open --home {dir}</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"#,
+        user = xml_escape(user),
+        exe = xml_escape(&exe.to_string_lossy()),
+        dir = xml_escape(&windows_quote(&dir.to_string_lossy())),
+    )
+}
+
+fn install_task(home: &Home, exe: &Path) -> Result<()> {
+    let var = |name: &str| std::env::var(name).with_context(|| format!("cannot find {name}"));
+    let user = format!("{}\\{}", var("USERDOMAIN")?, var("USERNAME")?);
+    // schtasks reads the file as UTF-16, the way Task Scheduler exports tasks.
+    let mut xml = vec![0xFF, 0xFE];
+    xml.extend(task_xml(exe, &home.dir, &user).encode_utf16().flat_map(u16::to_le_bytes));
+    let file = std::env::temp_dir().join("kanzo-task.xml");
+    std::fs::write(&file, xml).with_context(|| format!("cannot write {}", file.display()))?;
+    // Replace an older install so a changed path or data folder takes effect.
+    let _ = Command::new("schtasks").args(["/End", "/TN", TASK]).output();
+    let created = run("schtasks", &["/Create", "/TN", TASK, "/XML", &file.to_string_lossy(), "/F"]);
+    let _ = std::fs::remove_file(&file);
+    created?;
+    run("schtasks", &["/Run", "/TN", TASK])?;
+    println!(
+        "Kanzo now starts at login and is running at http://localhost:{}\nLogs: {}",
+        home.config.port,
+        log_path()?.display()
+    );
+    Ok(())
+}
+
+fn uninstall_task() -> Result<()> {
+    let installed = Command::new("schtasks").args(["/Query", "/TN", TASK]).output().is_ok_and(|o| o.status.success());
+    if !installed {
+        println!("The Kanzo task was not installed.");
+        return Ok(());
+    }
+    let _ = Command::new("schtasks").args(["/End", "/TN", TASK]).output();
+    run("schtasks", &["/Delete", "/TN", TASK, "/F"])?;
+    println!("Removed the Kanzo task; the board no longer starts at login.");
+    Ok(())
+}
+
+/// For the task's `--background`: closes the console window Windows opens for it, and
+/// sends what Kanzo prints to the log instead. Kanzo runs on without a log if it
+/// can't open one.
+#[cfg(windows)]
+pub fn detach_console() {
+    use std::os::windows::io::IntoRawHandle;
+    use windows_sys::Win32::System::Console::{FreeConsole, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle};
+    // SAFETY: no arguments; it only detaches this process from its console.
+    unsafe { FreeConsole() };
+    let Ok(path) = log_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let Ok(log) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else { return };
+    // The handle stays open for the life of the process: Rust's stdout and stderr
+    // look up the standard handles on every write.
+    let handle = log.into_raw_handle();
+    // SAFETY: `handle` is a valid file handle that is never closed.
+    unsafe {
+        SetStdHandle(STD_OUTPUT_HANDLE, handle);
+        SetStdHandle(STD_ERROR_HANDLE, handle);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +347,14 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("WantedBy=default.target"));
+    }
+
+    #[test]
+    fn task_quotes_paths() {
+        let text = task_xml(Path::new(r"C:\Users\a & b\.cargo\bin\kanzo.exe"), Path::new(r"D:\"), r"PC\a<b>");
+        assert!(text.contains(r"<Command>C:\Users\a &amp; b\.cargo\bin\kanzo.exe</Command>"), "{text}");
+        assert!(text.contains(r#"<Arguments>--background --no-open --home "D:\\"</Arguments>"#), "{text}");
+        assert!(text.contains(r"<UserId>PC\a&lt;b&gt;</UserId>"), "{text}");
+        assert_eq!(windows_quote(r"C:\Users\my kanzo"), r#""C:\Users\my kanzo""#);
     }
 }

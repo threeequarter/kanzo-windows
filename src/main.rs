@@ -32,6 +32,10 @@ struct Cli {
     #[arg(long)]
     no_open: bool,
 
+    /// Run without a console window, logging to a file: the Windows logon task passes it
+    #[arg(long, hide = true)]
+    background: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -71,7 +75,7 @@ enum Command {
     },
     /// Install the latest release over this Kanzo, and restart the board's service
     Update,
-    /// Start the board automatically at login (macOS and Linux)
+    /// Start the board automatically at login
     Service {
         #[command(subcommand)]
         action: ServiceAction,
@@ -80,7 +84,8 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ServiceAction {
-    /// Install and start a service that runs the board at login (LaunchAgent on macOS, systemd on Linux)
+    /// Install and start a service that runs the board at login (LaunchAgent on macOS, systemd on Linux,
+    /// a Task Scheduler task on Windows)
     Install,
     /// Stop and remove that service
     Uninstall,
@@ -88,6 +93,10 @@ enum ServiceAction {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if cli.background {
+        #[cfg(windows)]
+        service::detach_console();
+    }
     // One thread runs all the async work: the board serves one person, and each
     // agent starts its own `kanzo mcp`. Database calls run on a few blocking
     // threads that exit when idle. This keeps kanzo light on small boards.
@@ -147,6 +156,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 /// `kanzo update`: installs the latest release over this program, then restarts the
 /// board's service, if there is one, so it runs the new version too.
 fn update_kanzo() -> anyhow::Result<()> {
+    if !update::SELF_UPDATE {
+        anyhow::bail!(update::NO_SELF_UPDATE);
+    }
     let Some(latest) = update::latest(true) else {
         anyhow::bail!("can't reach GitHub to check for updates");
     };

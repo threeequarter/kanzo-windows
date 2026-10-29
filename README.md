@@ -18,6 +18,22 @@ Kanzo is a kanban board in your browser and an MCP server in one small program, 
   <img alt="The Kanzo board: agents move cards while you watch, and ⌘K finds a task in any project" src="docs/img/board-light.gif">
 </picture>
 
+## Windows (this fork)
+
+This fork adds Windows on ARM64 and x64. It doesn't update itself: merge `upstream/main` and build again.
+
+Build with [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) (no Visual Studio needed) unpacked to `~/.llvm-mingw`, from Git Bash:
+
+```sh
+rustup toolchain install stable-aarch64-pc-windows-gnullvm --profile minimal
+rustup target add --toolchain stable-aarch64-pc-windows-gnullvm x86_64-pc-windows-gnullvm
+export PATH="$HOME/.llvm-mingw/bin:$PATH"
+cargo +stable-aarch64-pc-windows-gnullvm build --release                                   # ARM64: target/release/kanzo.exe
+cargo +stable-aarch64-pc-windows-gnullvm build --release --target x86_64-pc-windows-gnullvm # x64: target/x86_64-pc-windows-gnullvm/release/kanzo.exe
+```
+
+Each `kanzo.exe` needs only what Windows ships. Copy it to a folder on `PATH`, such as `~/.cargo/bin`, rather than running it from `target`, which the next build overwrites. Then `kanzo service install` adds a Task Scheduler task that starts the board at logon, without admin rights; logs go to `%LOCALAPPDATA%\kanzo\kanzo.log`. To install a new build: `kanzo service uninstall`, replace the file, `kanzo service install`.
+
 ## Install
 
 ```sh

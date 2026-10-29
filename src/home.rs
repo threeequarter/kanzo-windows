@@ -88,7 +88,7 @@ impl Home {
     /// Opens the data folder, creating it and its files on first use.
     pub fn open(dir: PathBuf) -> Result<Self> {
         fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
-        let dir = dir.canonicalize().unwrap_or(dir);
+        let dir = dir.canonicalize().map(without_verbatim).unwrap_or(dir);
         write_if_missing(&dir.join("config.toml"), CONFIG_TEMPLATE)?;
         write_if_missing(&dir.join(".gitignore"), GITIGNORE)?;
 
@@ -114,7 +114,22 @@ impl Home {
             use std::os::unix::fs::MetadataExt;
             fs::metadata(self.db_path()).map(|m| m.ino()).unwrap_or(0)
         }
-        #[cfg(not(unix))]
+        // Not the creation time: NTFS gives a file deleted and made again under the same
+        // name, as git does on pull, the old one's.
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle};
+            let Ok(file) = File::open(self.db_path()) else { return 0 };
+            // SAFETY: plain data, filled in by the call below.
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: the handle stays open for the call, and `info` is a valid place to write.
+            if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+                return 0;
+            }
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow)
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             0
         }
@@ -193,7 +208,34 @@ fn unsupported(e: &io::Error) -> bool {
     if matches!(e.raw_os_error(), Some(libc::ENOTSUP | libc::ENOLCK)) {
         return true;
     }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED};
+        if e.raw_os_error().is_some_and(|c| [ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED].contains(&(c as u32))) {
+            return true;
+        }
+    }
     e.kind() == io::ErrorKind::Unsupported
+}
+
+/// Windows canonical paths start with `\\?\`, which people, and some programs that
+/// agents run, don't take: `C:\Users\ada\kanzo` reads better and means the same.
+#[cfg(windows)]
+fn without_verbatim(path: PathBuf) -> PathBuf {
+    use std::path::{Component, Prefix};
+    let (Some(Component::Prefix(prefix)), Some(text)) = (path.components().next(), path.to_str()) else {
+        return path;
+    };
+    match prefix.kind() {
+        Prefix::VerbatimDisk(_) => PathBuf::from(&text[4..]),
+        Prefix::VerbatimUNC(..) => PathBuf::from(format!(r"\\{}", &text[8..])),
+        _ => path,
+    }
+}
+
+#[cfg(not(windows))]
+fn without_verbatim(path: PathBuf) -> PathBuf {
+    path
 }
 
 fn write_if_missing(path: &Path, contents: &str) -> Result<()> {
@@ -251,6 +293,31 @@ mod tests {
         assert!(unsupported(&io::Error::from(io::ErrorKind::Unsupported)));
         #[cfg(unix)]
         assert!(unsupported(&io::Error::from_raw_os_error(libc::ENOLCK)));
+        #[cfg(windows)]
+        assert!(unsupported(&io::Error::from_raw_os_error(50)));
         assert!(!unsupported(&io::Error::from(io::ErrorKind::PermissionDenied)));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn paths_without_verbatim_prefix() {
+        assert_eq!(without_verbatim(r"\\?\C:\Users\ada\kanzo".into()), PathBuf::from(r"C:\Users\ada\kanzo"));
+        assert_eq!(without_verbatim(r"\\?\UNC\nas\home\kanzo".into()), PathBuf::from(r"\\nas\home\kanzo"));
+        assert_eq!(without_verbatim(r"C:\kanzo".into()), PathBuf::from(r"C:\kanzo"));
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!Home::open(tmp.path().to_path_buf()).unwrap().dir.to_string_lossy().starts_with(r"\\?\"));
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn identity_changes_when_the_database_is_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = Home::open(tmp.path().to_path_buf()).unwrap();
+        let before = home.db_identity();
+        let copy = tmp.path().join("copy.db");
+        fs::copy(home.db_path(), &copy).unwrap();
+        fs::remove_file(home.db_path()).unwrap();
+        fs::rename(&copy, home.db_path()).unwrap();
+        assert_ne!(home.db_identity(), before);
     }
 }

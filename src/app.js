@@ -1330,7 +1330,9 @@ async function checkForUpdates() {
   try {
     const status = await api("GET", "/update?now=1");
     showUpdate(status);
-    if (status.available) {
+    if (status.off) {
+      toast(`This build doesn't update itself: merge upstream and build it again (you have ${status.current})`);
+    } else if (status.available) {
       if (confirm(`Kanzo ${status.available} is out (you have ${status.current}). Download and install it now? The board restarts.`)) {
         installUpdate(status.available);
       }
